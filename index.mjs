@@ -1,0 +1,696 @@
+/**
+ * Sync2 KVS Consumer Lambda
+ * --------------------------
+ * Reads raw audio from Kinesis Video Stream and sends to Faster Whisper STT.
+ * Triggered by sipLambda when USE_FASTER_WHISPER_STT=true.
+ *
+ * Flow:
+ * 1. Receives KVS stream ARN and call metadata from sipLambda
+ * 2. Connects to KVS and reads audio fragments
+ * 3. Converts audio to PCM format
+ * 4. Streams to Faster Whisper STT server
+ * 5. Sends transcripts to SQS for processing
+ */
+
+import {
+  KinesisVideoClient,
+  GetDataEndpointCommand,
+} from "@aws-sdk/client-kinesis-video";
+import {
+  KinesisVideoMediaClient,
+  GetMediaCommand,
+} from "@aws-sdk/client-kinesis-video-media";
+import {
+  SQSClient,
+  SendMessageCommand,
+} from "@aws-sdk/client-sqs";
+import pg from "pg";
+import WebSocket from "ws";
+
+const { Pool } = pg;
+
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// ---------- AI PHRASE FILTER ----------
+// These patterns detect AI-generated speech that gets transcribed from mixed audio
+// This prevents the AI from processing its own TTS output as customer speech
+const AI_PHRASE_PATTERNS = [
+  // Greetings & Welcome
+  /how may i help/i, /how can i help/i, /how can i assist/i, /how may i assist/i,
+  /welcome to.*medical/i, /rpb medical/i, /pharmasync/i,
+  /thank you for calling/i, /thanks for calling/i,
+
+  // AI Response patterns
+  /i.?d be happy to/i, /i.?ll be happy to/i, /happy to help/i,
+  /i can help you/i, /let me help/i,
+  /sure,? i.?d/i, /sure thing/i, /certainly/i, /absolutely/i, /of course/i,
+  /no problem/i, /no worries/i,
+
+  // AI Actions
+  /let me (see|check|look|find|get|help|assist|know|refocus)/i,
+  /let me see/i, /let me check/i,
+  /i.?ll (need|check|look|get|help)/i,
+
+  // Scheduling phrases (AI typically says these)
+  /what type of appointment/i, /looking to (book|schedule)/i,
+  /can i get your/i, /may i have your/i, /could you (provide|give|tell)/i,
+  /get that scheduled/i, /help you schedule/i,
+
+  // Clarifications
+  /not sure i caught/i, /could you repeat/i, /didn.?t quite catch/i,
+  /you mentioned/i, /you said/i, /you need/i,
+  // More clarification phrases
+  /not quite sure what you mean/i, /hmm,? i.?m not/i, /i.?m not quite sure/i,
+  /could you clarify/i, /what do you mean by/i, /can you explain/i,
+  /i want to make sure/i, /make sure i (help|understand)/i,
+  /are you looking for/i, /looking for a specific/i,
+
+  // Farewells (AI says these)
+  /take care/i, /have a (great|good|wonderful|nice) day/i,
+  /thanks (so much )?for (calling|reaching out)/i,
+  /is there anything else/i, /anything else i can/i,
+
+  // Common AI filler/acknowledgments
+  /^alright[,.]?$/i, /^okay[,.]?$/i, /^got it[,.]?$/i, /^awesome[,.]?!?$/i,
+  /^perfect[,.]?$/i, /^great[,.]?$/i, /^sure[,.]?$/i,
+
+  // Hallucinated phrases from distorted TTS
+  /we love you/i, /thanks for watching/i, /see you (next|in the)/i,
+  /subscribe/i, /like and subscribe/i,
+
+  // Short AI phrases that get transcribed (often during barge-in or distorted)
+  /^thank you\.?$/i, /^thank you[,.]? ?(bye|goodbye)?\.?$/i,
+  /^bye[,.]?$/i, /^goodbye[,.]?$/i,
+  /thank you\.? thank you/i,
+  /^hello[,.]?$/i, /^hi[,.]?$/i,
+  /^yes[,.]?$/i, /^yeah[,.]?$/i, /^and[,.]?$/i,
+];
+
+/**
+ * Check if transcript matches AI speech patterns
+ */
+function isAiGeneratedPhrase(transcript) {
+  if (!transcript) return false;
+  const text = transcript.trim();
+  return AI_PHRASE_PATTERNS.some(pattern => pattern.test(text));
+}
+
+// ---------- CONFIG ----------
+const REGION = process.env.AWS_REGION || "us-east-1";
+const FASTER_WHISPER_STT_URL = process.env.FASTER_WHISPER_STT_URL || "ws://44.216.12.223:8766";
+const TRANSCRIPT_QUEUE_URL_GROUP = process.env.TRANSCRIPT_QUEUE_URL_GROUP;
+
+const PG_CONFIG = {
+  host: process.env.PGHOST,
+  port: parseInt(process.env.PGPORT || "5432"),
+  database: process.env.PGDATABASE,
+  user: process.env.PGUSER,
+  password: process.env.PGPASSWORD,
+  ssl: { rejectUnauthorized: false, require: true },
+};
+
+// ---------- CLIENTS ----------
+const kinesisVideo = new KinesisVideoClient({ region: REGION });
+const sqs = new SQSClient({ region: REGION });
+const pgPool = new Pool(PG_CONFIG);
+
+// ---------- HANDLER ----------
+export const handler = async (event) => {
+  console.log("🎙️ KVS Consumer Lambda invoked");
+  console.log("📥 Event:", JSON.stringify(event, null, 2));
+
+  // Handle direct invocation from sipLambda
+  if (event.source === "sipLambda" && event.streamArn) {
+    return processKVSStream(event);
+  }
+
+  // Handle SQS trigger (alternative approach)
+  if (event.Records?.[0]?.eventSource === "aws:sqs") {
+    for (const record of event.Records) {
+      try {
+        const msg = JSON.parse(record.body);
+        if (msg.streamArn) {
+          await processKVSStream(msg);
+        }
+      } catch (err) {
+        console.error("❌ Failed to parse SQS message:", err);
+      }
+    }
+    return { statusCode: 200, body: "OK" };
+  }
+
+  return { statusCode: 400, body: "Unknown event source" };
+};
+
+// ---------- MAIN PROCESSING ----------
+async function processKVSStream(event) {
+  const {
+    streamArn,
+    callSessionId,
+    callId,
+    fromE164,
+    toE164,
+    mipId,
+  } = event;
+
+  console.log(`📞 Processing KVS stream for call ${callId}`);
+  console.log(`   Stream ARN: ${streamArn}`);
+  console.log(`   From: ${fromE164} → To: ${toE164}`);
+
+  try {
+    // Step 1: Get the data endpoint for the KVS stream
+    const endpointResponse = await kinesisVideo.send(
+      new GetDataEndpointCommand({
+        StreamARN: streamArn,
+        APIName: "GET_MEDIA",
+      })
+    );
+
+    const dataEndpoint = endpointResponse.DataEndpoint;
+    console.log(`📍 KVS Data Endpoint: ${dataEndpoint}`);
+
+    // Step 2: Create KVS Media client with the endpoint
+    const kvsMediaClient = new KinesisVideoMediaClient({
+      region: REGION,
+      endpoint: dataEndpoint,
+    });
+
+    // Step 3: Get media from the stream
+    const mediaResponse = await kvsMediaClient.send(
+      new GetMediaCommand({
+        StreamARN: streamArn,
+        StartSelector: {
+          StartSelectorType: "NOW",
+        },
+      })
+    );
+
+    console.log(`🎵 Content-Type: ${mediaResponse.ContentType}`);
+
+    // Step 4: Get channel ID for the call (may not be attached immediately)
+    let channelId = await getChannelForSession(callSessionId);
+    if (!channelId) {
+      console.warn(`⚠️ Channel ID missing for call_session ${callSessionId}. Waiting for ARI to attach...`);
+      channelId = await waitForChannelAttachment(callSessionId);
+      if (!channelId) {
+        console.warn(`⚠️ Still no channel mapping for call_session ${callSessionId}. Proceeding with session fallback.`);
+      }
+    }
+
+    // Step 5: Process audio stream with Faster Whisper
+    await processAudioStream(
+      mediaResponse.Payload,
+      callSessionId,
+      channelId,
+      mipId,
+      fromE164,
+      toE164
+    );
+
+    console.log(`✅ KVS processing completed for call ${callId}`);
+    return { statusCode: 200, body: "Processed" };
+
+  } catch (err) {
+    console.error(`❌ KVS processing error: ${err.message}`);
+    console.error(err.stack);
+    return { statusCode: 500, body: err.message };
+  }
+}
+
+// ---------- AUDIO STREAM PROCESSING ----------
+async function processAudioStream(payloadStream, callSessionId, initialChannelId, mipId, fromE164, toE164) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(FASTER_WHISPER_STT_URL);
+    let lastTranscriptTime = 0;
+    let isConnected = false;
+    let fragmentCount = 0;
+
+    // MKV parser state
+    const mkvParser = new MKVAudioExtractor();
+
+    // Audio buffer for accumulating PCM data before sending
+    // Send chunks of ~3200 bytes (200ms of 8kHz 16-bit mono audio)
+    let pcmBuffer = Buffer.alloc(0);
+    const CHUNK_SIZE = 3200; // 200ms at 8kHz 16-bit mono
+
+    ws.on("open", () => {
+      console.log(`🔌 Connected to Faster Whisper STT: ${FASTER_WHISPER_STT_URL}`);
+      isConnected = true;
+
+      // Configure the STT session
+      // KVS audio is typically 8kHz PCM from phone calls
+      ws.send(JSON.stringify({
+        type: "config",
+        sample_rate: 8000,
+        encoding: "pcm16",
+        call_session_id: callSessionId,
+      }));
+    });
+
+    let channelId = initialChannelId;
+
+    ws.on("message", async (data) => {
+      try {
+        const event = JSON.parse(data.toString());
+        const eventType = event.type || "";
+
+        if (eventType === "transcript") {
+          const transcript = (event.transcript || "").trim();
+          const isPartial = event.is_partial || false;
+
+          if (!transcript || transcript.length < 3) return;
+
+          // 🎤 AI PHRASE FILTER: Block AI self-transcription at source
+          // This prevents the mixed audio (caller + AI TTS) from causing feedback loops
+          if (isAiGeneratedPhrase(transcript)) {
+            console.log(`🔇 [AI-FILTER] Blocked ${isPartial ? "partial" : "FINAL"}: "${transcript.substring(0, 60)}..."`);
+            return; // Don't send AI speech to SQS
+          }
+
+          // Rate limit partials
+          const now = Date.now();
+          if (isPartial && (now - lastTranscriptTime) < 500) return;
+          lastTranscriptTime = now;
+
+          if (!channelId) {
+            channelId = await waitForChannelAttachment(callSessionId, 10, 250);
+          }
+
+          console.log(`📝 ${isPartial ? "Partial" : "Final"}: "${transcript.substring(0, 50)}..."`);
+
+          // Send to SQS
+          await sendTranscriptToQueue({
+            transcript,
+            mipId,
+            isPartial,
+            callSessionId,
+            channelId,
+            meta: { fromE164, toE164 },
+            source: "faster-whisper",
+          });
+
+        } else if (eventType === "barge_in") {
+          // Log barge-in but don't send separate message - partials already trigger barge-in in ARIend
+          // Sending separate barge_in messages causes "missing transcript field" warnings
+          console.log(`🎤 Barge-in detected! Confidence: ${event.confidence?.toFixed(2)}`);
+          // Note: Removed sendBargeInToQueue - partial transcripts already handle barge-in
+
+        } else if (eventType === "silence") {
+          console.log(`🔇 Silence: ${event.duration_ms}ms`);
+        }
+      } catch (err) {
+        console.error(`❌ Error parsing STT response: ${err.message}`);
+      }
+    });
+
+    ws.on("close", () => {
+      console.log(`🔌 Faster Whisper connection closed. Processed ${fragmentCount} fragments.`);
+      resolve();
+    });
+
+    ws.on("error", (err) => {
+      console.error(`❌ WebSocket error: ${err.message}`);
+      reject(err);
+    });
+
+    // Handle ping/pong to keep connection alive
+    // Server sends ping every 60s, we must respond with pong
+    ws.on("ping", () => {
+      console.log(`🏓 Received ping from STT server, sending pong`);
+      ws.pong();
+    });
+
+    // Process the KVS payload stream
+    // KVS returns MKV-formatted data with audio fragments
+    payloadStream.on("data", (chunk) => {
+      if (!isConnected) return;
+
+      fragmentCount++;
+
+      // Extract audio from MKV container using proper parser
+      const audioFrames = mkvParser.addChunk(chunk);
+
+      for (const audioData of audioFrames) {
+        if (audioData && audioData.length > 0) {
+          // Accumulate audio in buffer
+          pcmBuffer = Buffer.concat([pcmBuffer, audioData]);
+
+          // Send chunks when we have enough data
+          while (pcmBuffer.length >= CHUNK_SIZE) {
+            // Ensure we send even number of bytes (16-bit PCM)
+            const sendSize = Math.floor(CHUNK_SIZE / 2) * 2;
+            const toSend = pcmBuffer.slice(0, sendSize);
+            pcmBuffer = pcmBuffer.slice(sendSize);
+
+            ws.send(toSend);
+          }
+        }
+      }
+
+      if (fragmentCount % 100 === 0) {
+        console.log(`📊 Processed ${fragmentCount} audio fragments, buffer: ${pcmBuffer.length} bytes`);
+      }
+    });
+
+    payloadStream.on("end", () => {
+      console.log(`📭 KVS stream ended. Total fragments: ${fragmentCount}`);
+
+      // Send any remaining buffered audio (ensure even byte count)
+      if (pcmBuffer.length > 0 && isConnected && ws.readyState === WebSocket.OPEN) {
+        const finalSize = Math.floor(pcmBuffer.length / 2) * 2;
+        if (finalSize > 0) {
+          ws.send(pcmBuffer.slice(0, finalSize));
+        }
+      }
+
+      // Signal end of audio
+      if (isConnected && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "end" }));
+
+        // Give time for final transcripts
+        setTimeout(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.close();
+          }
+        }, 5000);
+      } else {
+        resolve();
+      }
+    });
+
+    payloadStream.on("error", (err) => {
+      console.error(`❌ KVS stream error: ${err.message}`);
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.close();
+      }
+      reject(err);
+    });
+
+    // Timeout after 5 minutes (max Lambda duration consideration)
+    setTimeout(() => {
+      console.log("⏰ Processing timeout reached");
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "end" }));
+        setTimeout(() => ws.close(), 2000);
+      }
+    }, 5 * 60 * 1000);
+  });
+}
+
+// ---------- MKV AUDIO EXTRACTION ----------
+/**
+ * MKV Element IDs used in KVS streams
+ */
+const MKV_ELEMENTS = {
+  EBML: 0x1A45DFA3,
+  SEGMENT: 0x18538067,
+  CLUSTER: 0x1F43B675,
+  TIMECODE: 0xE7,
+  SIMPLE_BLOCK: 0xA3,
+  BLOCK: 0xA1,
+  BLOCK_GROUP: 0xA0,
+  TRACKS: 0x1654AE6B,
+  TRACK_ENTRY: 0xAE,
+  TRACK_NUMBER: 0xD7,
+  TRACK_TYPE: 0x83,
+  CODEC_ID: 0x86,
+};
+
+/**
+ * MKV Audio Extractor - Properly parses MKV/WebM container format
+ * to extract raw PCM audio frames from KVS streams.
+ */
+class MKVAudioExtractor {
+  constructor() {
+    this.buffer = Buffer.alloc(0);
+    this.audioTrackNumber = 1; // Default, updated from track info
+    this.headerParsed = false;
+    this.inCluster = false;
+  }
+
+  /**
+   * Add a chunk of MKV data and return extracted audio frames
+   */
+  addChunk(chunk) {
+    this.buffer = Buffer.concat([this.buffer, chunk]);
+    const audioFrames = [];
+
+    while (this.buffer.length > 0) {
+      const result = this.parseElement();
+      if (!result) break;
+
+      const { consumed, audioData } = result;
+
+      if (audioData) {
+        audioFrames.push(audioData);
+      }
+
+      this.buffer = this.buffer.slice(consumed);
+    }
+
+    return audioFrames;
+  }
+
+  /**
+   * Parse a single EBML element from the buffer
+   */
+  parseElement() {
+    if (this.buffer.length < 2) return null;
+
+    // Read element ID (variable length, 1-4 bytes)
+    const idResult = this.readVINT(this.buffer, 0, true);
+    if (!idResult) return null;
+    const { value: elementId, length: idLen } = idResult;
+
+    if (this.buffer.length < idLen + 1) return null;
+
+    // Read element size (variable length)
+    const sizeResult = this.readVINT(this.buffer, idLen, false);
+    if (!sizeResult) return null;
+    const { value: elementSize, length: sizeLen } = sizeResult;
+
+    const headerLen = idLen + sizeLen;
+
+    // Handle unknown/very large sizes (streaming mode)
+    const isUnknownSize = elementSize === -1;
+
+    // For container elements, we don't need the full content
+    // For data elements (SimpleBlock), we do
+    if (elementId === MKV_ELEMENTS.SIMPLE_BLOCK || elementId === MKV_ELEMENTS.BLOCK) {
+      // Need full element data
+      if (!isUnknownSize && this.buffer.length < headerLen + elementSize) {
+        return null; // Wait for more data
+      }
+
+      const audioData = this.parseSimpleBlock(
+        this.buffer.slice(headerLen, headerLen + elementSize)
+      );
+
+      return {
+        consumed: headerLen + elementSize,
+        audioData,
+      };
+    }
+
+    // Container elements - just skip the header and continue parsing children
+    if (
+      elementId === MKV_ELEMENTS.EBML ||
+      elementId === MKV_ELEMENTS.SEGMENT ||
+      elementId === MKV_ELEMENTS.CLUSTER ||
+      elementId === MKV_ELEMENTS.TRACKS ||
+      elementId === MKV_ELEMENTS.TRACK_ENTRY ||
+      elementId === MKV_ELEMENTS.BLOCK_GROUP
+    ) {
+      if (elementId === MKV_ELEMENTS.CLUSTER) {
+        this.inCluster = true;
+      }
+      // Return header consumed, children will be parsed in next iterations
+      return { consumed: headerLen, audioData: null };
+    }
+
+    // Skip other elements
+    if (!isUnknownSize && this.buffer.length >= headerLen + elementSize) {
+      return { consumed: headerLen + elementSize, audioData: null };
+    }
+
+    // Can't process yet
+    return null;
+  }
+
+  /**
+   * Parse a SimpleBlock element to extract audio data
+   * Note: KVS from Chime Voice Connector typically has single track (mixed audio)
+   * The AI feedback loop issue needs to be solved at ARIend level
+   */
+  parseSimpleBlock(data) {
+    if (data.length < 4) return null;
+
+    // Track number (variable length integer)
+    const trackResult = this.readVINT(data, 0, false);
+    if (!trackResult) return null;
+
+    const trackNum = trackResult.value;
+    const trackLen = trackResult.length;
+
+    // Log track info occasionally for debugging (every 1000th block)
+    if (Math.random() < 0.001) {
+      console.log(`🎵 Audio block from track ${trackNum}`);
+    }
+
+    // Note: Track filtering disabled - KVS from Chime has single mixed track
+    // The feedback loop (AI hearing itself) needs to be handled in ARIend
+    // by ignoring transcripts that arrive while AI is speaking
+
+    // Timestamp (2 bytes, signed big-endian)
+    if (data.length < trackLen + 2) return null;
+    // const timestamp = data.readInt16BE(trackLen);
+
+    // Flags (1 byte)
+    if (data.length < trackLen + 3) return null;
+    // const flags = data[trackLen + 2];
+
+    // Audio data starts after header (track + timestamp + flags)
+    const audioStart = trackLen + 3;
+    if (data.length <= audioStart) return null;
+
+    // Extract raw audio data
+    const audioData = data.slice(audioStart);
+
+    return audioData;
+  }
+
+  /**
+   * Read a variable-length integer (VINT) from buffer
+   * @param buf Buffer to read from
+   * @param offset Start offset
+   * @param keepMarker If true, include marker bit in value (for element IDs)
+   */
+  readVINT(buf, offset, keepMarker) {
+    if (offset >= buf.length) return null;
+
+    const firstByte = buf[offset];
+    let length = 1;
+    let mask = 0x80;
+
+    // Find the length by looking at leading bits
+    while (length <= 8 && !(firstByte & mask)) {
+      length++;
+      mask >>= 1;
+    }
+
+    if (length > 8 || offset + length > buf.length) {
+      return null;
+    }
+
+    let value = keepMarker ? firstByte : firstByte & (mask - 1);
+
+    for (let i = 1; i < length; i++) {
+      value = (value << 8) | buf[offset + i];
+    }
+
+    // Check for unknown size marker (all 1s after VINT marker)
+    if (!keepMarker) {
+      const maxVal = Math.pow(2, 7 * length) - 1;
+      if (value === maxVal) {
+        return { value: -1, length }; // Unknown size
+      }
+    }
+
+    return { value, length };
+  }
+}
+
+// ---------- DATABASE HELPERS ----------
+async function getChannelForSession(callSessionId) {
+  if (!callSessionId) return null;
+
+  const client = await pgPool.connect();
+  try {
+    const res = await client.query(
+      `SELECT asterisk_channel_id FROM call_sessions WHERE id = $1`,
+      [callSessionId]
+    );
+    return res.rows[0]?.asterisk_channel_id || null;
+  } catch (err) {
+    console.error(`❌ DB error getting channel: ${err.message}`);
+    return null;
+  } finally {
+    client.release();
+  }
+}
+
+async function waitForChannelAttachment(callSessionId, attempts = 20, delayMs = 250) {
+  for (let i = 0; i < attempts; i++) {
+    const channelId = await getChannelForSession(callSessionId);
+    if (channelId) {
+      return channelId;
+    }
+    await wait(delayMs);
+  }
+  return null;
+}
+
+// ---------- SQS HELPERS ----------
+async function sendTranscriptToQueue(payload) {
+  if (!TRANSCRIPT_QUEUE_URL_GROUP) {
+    console.warn("⚠️ No TRANSCRIPT_QUEUE_URL_GROUP configured");
+    return;
+  }
+
+  try {
+    const messageBody = {
+      type: "transcript",
+      transcript: payload.transcript,
+      isPartial: payload.isPartial,
+      callSessionId: payload.callSessionId,
+      asteriskChannelId: payload.channelId,
+      mipId: payload.mipId,
+      meta: payload.meta,
+      source: payload.source,
+      timestamp: Date.now(),
+    };
+
+    const messageGroupId = `call-${payload.callSessionId}`;
+
+    await sqs.send(
+      new SendMessageCommand({
+        QueueUrl: TRANSCRIPT_QUEUE_URL_GROUP,
+        MessageBody: JSON.stringify(messageBody),
+        MessageGroupId: messageGroupId,
+        MessageDeduplicationId: `transcript-${payload.callSessionId}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      })
+    );
+
+    console.log(`📤 Sent ${payload.isPartial ? "partial" : "final"} transcript to SQS`);
+  } catch (err) {
+    console.error(`❌ SQS send error: ${err.message}`);
+  }
+}
+
+async function sendBargeInToQueue(callSessionId, channelId, confidence) {
+  if (!TRANSCRIPT_QUEUE_URL_GROUP) return;
+
+  try {
+    const messageBody = {
+      type: "barge_in",
+      asteriskChannelId: channelId,
+      callSessionId,
+      confidence,
+      timestamp: Date.now(),
+      source: "faster-whisper",
+    };
+
+    await sqs.send(
+      new SendMessageCommand({
+        QueueUrl: TRANSCRIPT_QUEUE_URL_GROUP,
+        MessageBody: JSON.stringify(messageBody),
+        MessageGroupId: `call-${callSessionId}`,
+        MessageDeduplicationId: `bargein-${callSessionId}-${Date.now()}`,
+      })
+    );
+
+    console.log(`📤 Sent barge-in notification to SQS`);
+  } catch (err) {
+    console.error(`❌ Failed to send barge-in: ${err.message}`);
+  }
+}

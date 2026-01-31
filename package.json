@@ -1,0 +1,23 @@
+{
+  "name": "sync2-kvs-consumer-lambda",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Reads raw audio from Kinesis Video Stream and sends to Faster Whisper STT",
+  "main": "index.mjs",
+  "dependencies": {
+    "@aws-sdk/client-kinesis-video": "^3.700.0",
+    "@aws-sdk/client-kinesis-video-media": "^3.700.0",
+    "@aws-sdk/client-sqs": "^3.700.0",
+    "pg": "^8.16.3",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": ["kvs", "stt", "faster-whisper", "lambda"],
+  "author": "",
+  "license": "ISC"
+}
