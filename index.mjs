@@ -527,16 +527,10 @@ async function processAudioStreamLegacy(payloadStream, callSessionId, initialCha
           });
 
         } else if (eventType === "barge_in") {
-          // 🚀 VAD-BASED BARGE-IN: Send immediately for faster interruption (~200ms vs ~800ms)
-          // This bypasses transcript filtering for instant playback stop
+          // Log barge-in but don't send separate message - partials already trigger barge-in in ARIend
+          // Sending separate barge_in messages causes "missing transcript field" warnings
           console.log(`🎤 Barge-in detected! Confidence: ${event.confidence?.toFixed(2)}`);
-
-          if (!channelId) {
-            channelId = await waitForChannelAttachment(callSessionId, 5, 200);
-          }
-
-          // Send barge_in signal to ARI bridge for immediate playback stop
-          await sendBargeInToQueue(callSessionId, channelId, event.confidence || 0.8);
+          // Note: Removed sendBargeInToQueue - partial transcripts already handle barge-in
 
         } else if (eventType === "silence") {
           console.log(`🔇 Silence: ${event.duration_ms}ms`);
